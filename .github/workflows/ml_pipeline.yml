@@ -1,0 +1,124 @@
+name: ml-pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.ci.txt
+          npm -g i @dvcorg/cml@latest
+
+      # --- Synthesize tiny raw data for CI (no external data needed) ---
+      - name: Create tiny raw v0 data
+        run: |
+          mkdir -p data_versions/v0 data_versions/v1 data/processed feature_repo mlflow_backend outputs models
+          python - << 'PY'
+          import pandas as pd
+          import numpy as np
+          import datetime as dt
+          def make_stock(sym, start="2019-01-01 09:15:00", mins=200):
+              ts = pd.date_range(start=start, periods=mins, freq="1min", tz="Asia/Kolkata")
+              base = 100 + np.cumsum(np.random.randn(mins).round(2))
+              vol = (np.random.rand(mins)*1000).round()
+              df = pd.DataFrame({
+                  "timestamp": ts,
+                  "open": base + np.random.randn(mins).round(2),
+                  "high": base + np.random.rand(mins)*1.0,
+                  "low": base - np.random.rand(mins)*1.0,
+                  "close": base,
+                  "volume": vol
+              })
+              df.to_csv(f"data_versions/v0/{sym}__EQ__NSE__NSE__MINUTE.csv", index=False)
+          for s in ["AARTIIND","ABCAPITAL","ADANIENT"]:
+              make_stock(s)
+          PY
+
+      - name: Preprocess (100 rows per file)
+        run: |
+          python scripts/preprocess.py --input-root data_versions --version v0 --output-root data/processed --sample-n 100
+          # Convert to parquet for Feast
+          python - << 'PY'
+          import pandas as pd, pathlib as p
+          base = p.Path("data/processed/v0")
+          for n in ["train","test"]:
+              df = pd.read_csv(base/f"{n}.csv", parse_dates=["timestamp"])
+              df.to_parquet(base/f"{n}.parquet", index=False)
+          PY
+
+      - name: Setup Feast repo
+        run: |
+          cat > feature_repo/feature_store.yaml <<'FSYAML'
+          project: stock_exam
+          registry: registry.db
+          provider: local
+          offline_store:
+            type: file
+          online_store:
+            type: sqlite
+            path: online_store.db
+          FSYAML
+
+          cat > feature_repo/feature_defs.py <<'FSPY'
+          from datetime import timedelta
+          from feast import Entity, FileSource, FeatureView, Field
+          from feast.types import Float32
+          from feast.value_type import ValueType
+          stock = Entity(name="stock_id", join_keys=["stock_id"], value_type=ValueType.STRING)
+          stock_file_source_v0 = FileSource(path="../data/processed/v0/train.parquet", timestamp_field="timestamp")
+          stock_features_view = FeatureView(
+              name="stock_features",
+              entities=[stock],
+              ttl=timedelta(days=365),
+              schema=[
+                  Field(name="rolling_avg_10", dtype=Float32),
+                  Field(name="volume_sum_10", dtype=Float32)
+              ],
+              source=stock_file_source_v0,
+              online=True,
+          )
+          FSPY
+
+          cd feature_repo
+          feast apply
+          feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Train & Evaluate (fast)
+        env:
+          MLFLOW_TRACKING_URI: file:${{ github.workspace }}/mlflow_backend
+        run: |
+          python scripts/train.py --version v0
+          python scripts/evaluate.py --version v0
+          python scripts/ci_report.py
+
+      - name: Upload CI artifacts (report + preds)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifacts
+          path: |
+            ci_report.md
+            outputs/*.csv
+
+      - name: Post CML report (only on PRs)
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml comment create --pr --publish ci_report.md

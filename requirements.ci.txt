@@ -1,0 +1,9 @@
+numpy<3
+pandas==2.3.3
+scikit-learn==1.7.2
+pyarrow>=14,<18
+mlflow==3.6.0
+feast==0.56.0
+dvc==3.63.0
+dvc-gs==3.0.2
+pytest>=7
