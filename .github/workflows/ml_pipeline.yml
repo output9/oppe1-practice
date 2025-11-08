@@ -24,28 +24,17 @@ jobs:
           npm -g i @dvcorg/cml@latest
 
       # --- Synthesize tiny raw data for CI (no external data needed) ---
-      - name: Create tiny raw v0 data
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Pull data via DVC (from GCS)
         run: |
-          mkdir -p data_versions/v0 data_versions/v1 data/processed feature_repo mlflow_backend outputs models
-          python - << 'PY'
-          import pandas as pd
-          import numpy as np
-          import datetime as dt
-          def make_stock(sym, start="2019-01-01 09:15:00", mins=200):
-              ts = pd.date_range(start=start, periods=mins, freq="1min", tz="Asia/Kolkata")
-              base = 100 + np.cumsum(np.random.randn(mins).round(2))
-              vol = (np.random.rand(mins)*1000).round()
-              df = pd.DataFrame({
-                  "timestamp": ts,
-                  "open": base + np.random.randn(mins).round(2),
-                  "high": base + np.random.rand(mins)*1.0,
-                  "low": base - np.random.rand(mins)*1.0,
-                  "close": base,
-                  "volume": vol
-              })
-              df.to_csv(f"data_versions/v0/{sym}__EQ__NSE__NSE__MINUTE.csv", index=False)
-          for s in ["AARTIIND","ABCAPITAL","ADANIENT"]:
-              make_stock(s)
+          pip install dvc dvc-gs
+          dvc pull
+          ls -R data_versions | head -50
+
           PY
 
       - name: Preprocess (100 rows per file)
