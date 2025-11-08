@@ -8,6 +8,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    env:
+      PYTHONVERSION: "3.11"
+      # Resolve to 'true' if a GCP SA key secret exists; otherwise 'false'
+      HAS_GCP: ${{ secrets.GCP_SA_KEY != '' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,7 +20,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHONVERSION }}
 
       - name: Install deps
         run: |
@@ -23,34 +28,75 @@ jobs:
           pip install -r requirements.ci.txt
           npm -g i @dvcorg/cml@latest
 
-      # --- Synthesize tiny raw data for CI (no external data needed) ---
-      - name: Authenticate to Google Cloud
+      # ---------------------------
+      # Data setup (ALWAYS GREEN):
+      # 1) If we have a GCP key AND this is a 'push', use real DVC data.
+      # 2) Otherwise (PRs / forks / no secret), synthesize tiny data.
+      # ---------------------------
+
+      - name: Authenticate to Google Cloud (push only, when secret present)
+        if: ${{ env.HAS_GCP == 'true' && github.event_name == 'push' }}
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Pull data via DVC (from GCS)
+      - name: Pull data via DVC (push only, when secret present)
+        if: ${{ env.HAS_GCP == 'true' && github.event_name == 'push' }}
         run: |
           pip install dvc dvc-gs
           dvc pull
           ls -R data_versions | head -50
 
-          PY
-
-      - name: Preprocess (100 rows per file)
+      - name: Create tiny raw v0 data (PRs or no secret)
+        if: ${{ !(env.HAS_GCP == 'true' && github.event_name == 'push') }}
         run: |
+          mkdir -p data_versions/v0 data_versions/v1 data/processed feature_repo mlflow_backend outputs models
+          python - << 'PY'
+          import pandas as pd, numpy as np
+          def make_stock(sym, mins=220):
+              ts = pd.date_range("2019-01-01 09:15:00", periods=mins, freq="1min", tz="Asia/Kolkata")
+              base = 100 + np.cumsum(np.random.randn(mins).round(2))
+              vol  = (np.random.rand(mins)*1000).round()
+              df = pd.DataFrame({
+                  "timestamp": ts,
+                  "open":  base + np.random.randn(mins).round(2),
+                  "high":  base + np.random.rand(mins)*1.0,
+                  "low":   base - np.random.rand(mins)*1.0,
+                  "close": base,
+                  "volume": vol
+              })
+              df.to_csv(f"data_versions/v0/{sym}__EQ__NSE__NSE__MINUTE.csv", index=False)
+          for s in ["AARTIIND","ABCAPITAL","ADANIENT"]:
+              make_stock(s)
+          PY
+          ls -1 data_versions/v0 | head
+
+      # ---------------------------
+      # Preprocess (fast: 100 rows per file)
+      # ---------------------------
+      - name: Preprocess v0 (fast)
+        run: |
+          mkdir -p data/processed
           python scripts/preprocess.py --input-root data_versions --version v0 --output-root data/processed --sample-n 100
-          # Convert to parquet for Feast
+
+      - name: Convert to Parquet for Feast
+        run: |
           python - << 'PY'
           import pandas as pd, pathlib as p
           base = p.Path("data/processed/v0")
           for n in ["train","test"]:
               df = pd.read_csv(base/f"{n}.csv", parse_dates=["timestamp"])
               df.to_parquet(base/f"{n}.parquet", index=False)
+          print("Parquet files:", list(base.glob("*.parquet")))
           PY
 
+      # ---------------------------
+      # Feast setup (local, robust)
+      # We overwrite minimal Feast files to ensure consistent CI env.
+      # ---------------------------
       - name: Setup Feast repo
         run: |
+          mkdir -p feature_repo
           cat > feature_repo/feature_store.yaml <<'FSYAML'
           project: stock_exam
           registry: registry.db
@@ -67,15 +113,21 @@ jobs:
           from feast import Entity, FileSource, FeatureView, Field
           from feast.types import Float32
           from feast.value_type import ValueType
+
           stock = Entity(name="stock_id", join_keys=["stock_id"], value_type=ValueType.STRING)
-          stock_file_source_v0 = FileSource(path="../data/processed/v0/train.parquet", timestamp_field="timestamp")
+
+          stock_file_source_v0 = FileSource(
+              path="../data/processed/v0/train.parquet",
+              timestamp_field="timestamp",
+          )
+
           stock_features_view = FeatureView(
               name="stock_features",
               entities=[stock],
               ttl=timedelta(days=365),
               schema=[
                   Field(name="rolling_avg_10", dtype=Float32),
-                  Field(name="volume_sum_10", dtype=Float32)
+                  Field(name="volume_sum_10", dtype=Float32),
               ],
               source=stock_file_source_v0,
               online=True,
@@ -86,17 +138,30 @@ jobs:
           feast apply
           feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
 
+      # ---------------------------
+      # Tests
+      # ---------------------------
       - name: Run tests
         run: pytest -q
 
-      - name: Train & Evaluate (fast)
+      # ---------------------------
+      # Train & Evaluate
+      # ---------------------------
+      - name: Train & Evaluate
         env:
           MLFLOW_TRACKING_URI: file:${{ github.workspace }}/mlflow_backend
         run: |
           python scripts/train.py --version v0
           python scripts/evaluate.py --version v0
           python scripts/ci_report.py
+          echo "----"
+          ls -lh outputs || true
+          echo "----"
+          head -20 ci_report.md || true
 
+      # ---------------------------
+      # Artifacts + PR comment
+      # ---------------------------
       - name: Upload CI artifacts (report + preds)
         uses: actions/upload-artifact@v4
         with:
@@ -111,3 +176,4 @@ jobs:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cml comment create --pr --publish ci_report.md
+
